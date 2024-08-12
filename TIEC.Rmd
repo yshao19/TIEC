@@ -1,0 +1,962 @@
+---
+title: "TIEC"
+author: "Yu Shao"
+date: "2024-08-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, warning = FALSE}
+# Install and load the packages if you haven't already
+library(ggplot2)
+library(readr)
+library(dplyr)
+library(clue)
+library(evd)
+```
+
+# TIEC Functions
+
+The following cell includes the functions of the RMTC algorithm for clustering high-dimensional tail dependent time series based on their tail index estimates.
+
+```{r}
+##### Functions Preparation #####
+
+# Epanechinikov Kernel
+Epanechnikov <- function(u) {
+  return(3 / 4 * (1 - u ^ 2) * (-1 <= u & u <= 1))
+}
+
+
+# Get the contigency table for clusters
+get_table <- function(A, B){
+  # Create contingency table
+  tab <- table(A, B)
+  
+  # Identify all possible categories (assuming categories are 1, 2, 3 for both A and B)
+  all_categories <- sort(unique(c(A, B)))
+  
+  # Make the contingency table square by adding zero-filled columns for missing categories
+  for (cat in all_categories) {
+    if (!(cat %in% colnames(tab))) {
+      tab <-
+        cbind(tab, matrix(
+          0,
+          nrow = nrow(tab),
+          ncol = 1,
+          dimnames = list(NULL, cat)
+        ))
+    }
+    if (!(cat %in% rownames(tab))) {
+      tab <-
+        rbind(tab, matrix(
+          0,
+          nrow = 1,
+          ncol = ncol(tab),
+          dimnames = list(cat, NULL)
+        ))
+    }
+  }
+  
+  # Rearrange columns to ensure correct order
+  tab <- tab[, as.character(all_categories)]
+  return(tab)
+}
+
+# Get the Rand Index for given clustering table
+rand <- function(tab){
+  n <- sum(tab)
+  ni <- apply(tab, 1, sum)
+  nj <- apply(tab, 2, sum)
+  n2 <- choose(n, 2)
+  1 + (sum(tab^2) - (sum(ni^2) + sum(nj^2))/2)/n2
+}
+
+########## cluster_metric ###########
+# Get the Cluster metric
+# Inputs:
+# A: n by 1 vector, target clustering
+# B: n by 1 vector, predicted clustering
+#
+# Outputs:
+# ARI: Adjusted Rand Index
+# loss: cluster loss
+cluster_metric <- function(A, B) {
+  
+  tab <- get_table(A, B)
+  
+  # Calculate cost matrix by inverting the table counts
+  max_value <- max(tab) + 1
+  cost_matrix <- max_value - tab
+  
+  
+  # Solve the Linear Sum Assignment Problem to minimize cost
+  assignment <- solve_LSAP(cost_matrix)
+  #print(assignment)
+  
+  # Map A to new labels according to the assignment solution
+  # Here, we're directly translating A's labels to what B expects them to be
+  A_permuted <- as.numeric(colnames(tab)[assignment])[A]
+  
+  # Evaluate the result
+  tab_permuted <- get_table(A_permuted, B)
+  
+  print(tab_permuted)
+  
+  ARI <- rand(tab_permuted)
+  cluster_loss <- sum(A_permuted != B) / length(A_permuted)
+  
+  return(list(ARI = ARI, loss = cluster_loss))
+}
+
+# Obtaining the local maxima given x and response y
+find_local_maxima_sorted <- function(x, y, delta = 0.2) {
+  # Calculate the number of points on each side of the current point based on delta
+  step_size <- x[2] - x[1]
+  width <- as.integer(delta / step_size / 2)
+  
+  n <- length(y)
+  maxima_indices <- integer(0)
+  
+  # Iterate over each point in the series, avoiding the boundaries
+  for (i in (width + 1):(n - width)) {
+    # Extract the neighborhood of the current point
+    local_window <- y[(i - width):(i + width)]
+    
+    # Check if the current point is the highest in its window
+    if (y[i] == max(local_window) && all(y[i] > local_window[-((width+1))])) {
+      maxima_indices <- c(maxima_indices, i)
+    }
+  }
+  
+  # Sort the indices by the corresponding y-values in descending order
+  sorted_indices <- maxima_indices[order(y[maxima_indices], decreasing = TRUE)]
+  
+  return(list(x = x[sorted_indices], y = y[sorted_indices]))
+}
+
+
+########## get_adaptive ###########
+# adaptive function
+# Inputs:
+# x: n by 1 vector, for a grid of vector
+# i: index number
+# m: num, number of parameters
+# Hpar: list, with columns:
+#     pi, weights
+#     theta, parameters(mean)
+#     sigma, parameters(variance) of the normal density
+#
+# Outputs:
+# a_i^{t}(x)
+
+get_adaptive <- function(x, i, m, Hpar) {
+  nu = Hpar$pi[i] * dnorm(x, Hpar$theta[i], Hpar$sigma[i])
+  if (length(x) > 1) {
+    de <-
+      rowSums(sapply(1:m, function(s) {
+        Hpar$pi[s] * dnorm(x, Hpar$theta[s], Hpar$sigma[s])
+      }))
+  } else{
+    de <-
+      sum(sapply(1:m, function(s) {
+        Hpar$pi[s] * dnorm(x, Hpar$theta[s], Hpar$sigma[s])
+      }))
+  }
+  
+  a = nu / (de + 1e-12)
+  return(a)
+}
+
+########## get_density ###########
+# adaptive kernel density estimate function
+# Inputs:
+# x: n by 1 vector, for a grid of vector
+# data: data input, index number
+# m: num, number of parameters
+# Hpar: list, with columns:
+#     pi, weights
+#     theta, parameters(mean)
+#     sigma, parameters(variance) of the normal density
+# K: kernel function, by default Epanechnikov
+#
+# Outputs:
+# gx: n by 1 vector, g_n^{t}(x), the density estimator
+get_density <- function(x, data, m, Hpar, K = Epanechnikov) {
+  n = length(data)
+  
+  cn = 2.283 * n ^ (-0.287) * Hpar$sigma
+  
+  gx <- numeric(length(x))
+  
+  for (j in 1:n) {
+    for (i in 1:m) {
+      gx <-
+        gx + (get_adaptive(data[j], i, m, Hpar) / cn[i]) * K((x - data[j]) / cn[i])
+    }
+  }
+  gx <- gx / n
+  
+  return(gx)
+}
+
+########## get_density_standard ###########
+# standard kernel density estimate function
+# Inputs:
+# x: n by 1 vector, for a grid of vector
+# data: data input, index number
+# K: kernel function, by default Epanechnikov
+#
+# Outputs:
+# gx: n by 1 vector, the density estimator
+get_density_standard <- function(x, data, K = Epanechnikov) {
+  n = length(data)
+  
+  sigma = sd(data)
+  
+  cn = 2.283 * (n ^ (-0.287)) * sigma
+  
+  gx <- numeric(length(x))
+  
+  for (j in 1:n) {
+    gx <-
+      gx + (1 / cn) * K((x - data[j]) / cn)
+    
+  }
+  gx <- gx / n
+  
+  return(gx)
+}
+
+
+###### Intermediate steps for calculating the Hellinger Index #####
+# H_i^t(phi): integral of sqrt
+get_Hv <- function(para, data, i, m, Hpar) {
+  #print(para)
+  theta = para[1]
+  sigma = para[2]
+  dx <- 1 / 100
+  xmin <- min(data) - 0.5
+  xmax <- max(data) + 0.5
+  
+  x <- seq(xmin + (dx / 2), xmax, dx)
+  integral_value <-
+    sum(sqrt(
+      get_adaptive(x, i = i, m = m, Hpar = Hpar) * dnorm(x, theta, sigma) * get_density(x, data, m, Hpar)
+    ) * dx)
+  return(integral_value)
+}
+
+# Negative H, used for optimization function
+get_negHv <- function(para, data, i, m, Hpar) {
+  -get_Hv(para, data, i, m, Hpar)
+}
+
+# H_i^t(phi): integral of sqrt
+get_Hv_fix_gx <- function(para, data, i, m, Hpar, m_fix, Hpar_fix) {
+  #print(para)
+  theta = para[1]
+  sigma = para[2]
+  dx <- 1 / 100
+  xmin <- min(data) - 0.5
+  xmax <- max(data) + 0.5
+  
+  x <- seq(xmin + (dx / 2), xmax, dx)
+  
+  integral_value <-
+    sum(sqrt(
+      get_adaptive(x, i = i, m = m, Hpar = Hpar) * dnorm(x, theta, sigma) * get_density(x, data, m_fix, Hpar_fix)
+    ) * dx)
+  return(integral_value)
+}
+
+# Negative H, used for optimization function
+get_negHv_fix_gx <- function(para, data, i, m, Hpar, m_fix, Hpar_fix) {
+  -get_Hv_fix_gx(para, data, i, m, Hpar, m_fix, Hpar_fix)
+}
+
+
+# Update pi for step t+1
+update_pi <- function(i, para, data, m, Hpar) {
+  nu = get_Hv(para, data, i, m, Hpar) ^ 2
+  
+  de <- sum(sapply(1:m, function(j) {
+    get_Hv(para, data, j, m, Hpar) ^ 2
+  }))
+  return(nu / de)
+}
+
+# Hillinger distance of step t
+get_Hdis <- function(m, Hpar, data) {
+  htemp <- sapply(1:m, function(i) {
+    get_Hv(c(Hpar$theta[i], Hpar$sigma[i]), data, i, m, Hpar)
+  })
+  return(as.numeric(sqrt(crossprod(Hpar$pi, htemp))))
+}
+
+# update the parameter theta(t+1), sigma(t+1), pi(t+1) with
+# parameters theta(t), sigma(t), pi(t)
+update_Hpara <- function(data, m, Hpar) {
+  theta_init <- Hpar$theta
+  sigma_init <- Hpar$sigma
+  # updated value
+  pib <- rep(0, m)
+  thetab <- rep(0, m)
+  sigmab <- rep(0, m)
+  for (i in 1:m) {
+    #print(i)
+    par_init <- c(theta_init[i], sigma_init[i])
+    
+    phi1 <- optim(
+      par_init,
+      get_negHv,
+      data = data,
+      i = i,
+      m = m,
+      Hpar = Hpar,
+      lower = c(min(data) - 1, (1e-3) * var(data)),
+      upper = c(max(data) + 1, (max(data) - min(data)) ^ 2),
+      method = "L-BFGS-B",
+      control = list(factr = 1e8, maxit = 40)
+    )
+    
+    thetab[i] = phi1$par[1]
+    sigmab[i] = phi1$par[2]
+  }
+  
+  # Update pi(t+1)
+  
+  pi_temp <- sapply(1:m, function(i) {
+    para = c(thetab[i], sigmab[i])
+    return((get_Hv(para, data, i, m, Hpar) ^ 2))
+  })
+  pib <- pi_temp / sum(pi_temp)
+  
+  hdis = get_Hdis(m, Hpar, data)
+  
+  return(list(
+    pi = pib,
+    theta = thetab,
+    sigma = sigmab,
+    hdis = hdis
+  ))
+}
+
+
+# update the parameter theta(t+1), sigma(t+1), pi(t+1) with
+# parameters theta(t), sigma(t), pi(t)
+update_Hpara_fix_gx <- function(data, m, Hpar, m_fix, Hpar_fix) {
+  theta_init <- Hpar$theta
+  sigma_init <- Hpar$sigma
+  # updated value
+  pib <- rep(0, m)
+  thetab <- rep(0, m)
+  sigmab <- rep(0, m)
+  for (i in 1:m) {
+    #print(i)
+    par_init <- c(theta_init[i], sigma_init[i])
+    
+    phi1 <- optim(
+      par_init,
+      get_negHv_fix_gx,
+      data = data,
+      i = i,
+      m = m,
+      Hpar = Hpar,
+      m_fix = m_fix,
+      Hpar_fix = Hpar_fix,
+      lower = c(min(data) - 0.5, (1e-3) * var(data)),
+      upper = c(max(data) + 0.5, (max(data) - min(data)) ^ 2),
+      method = "L-BFGS-B",
+      control = list(factr = 1e8, maxit = 50)
+    )
+    
+    thetab[i] = phi1$par[1]
+    sigmab[i] = phi1$par[2]
+  }
+  
+  # Update pi(t+1)
+  
+  pi_temp <- sapply(1:m, function(i) {
+    para = c(thetab[i], sigmab[i])
+    return((get_Hv(para, data, i, m, Hpar) ^ 2))
+  })
+  pib <- pi_temp / sum(pi_temp)
+  
+  hdis = get_Hdis(m, Hpar, data)
+  
+  return(list(
+    pi = pib,
+    theta = thetab,
+    sigma = sigmab,
+    hdis = hdis
+  ))
+}
+
+# For fix m, find the optimal Hillinger distance and corresponding parameters
+Hmix <- function(data,
+                 m,
+                 tol = 1e-5,
+                 maxiter = 50) {
+  
+  dx <- 1/100
+  x <- seq(min(data)-0.5, max(data)+0.5, dx)
+  gx_init <- get_density_standard(x = x, data = data, K = Epanechnikov)
+  
+  delta_neighbor <- 0.2
+  
+  local_maxima <- find_local_maxima_sorted(x, gx_init, delta_neighbor)
+  x_max <- local_maxima$x
+  gx_max <- local_maxima$y
+  
+  local_m <- length(x_max)
+  
+  if(m <= local_m){
+    theta_init <- x_max[1:m]
+    pi_init <- gx_max[1:m]/sum(gx_max[1:m])
+  }else{
+    theta_init <- c(x_max, quantile(data, (1:(m-local_m)) / (m - local_m + 1)))
+    gx_theta_init <- get_density_standard(x = theta_init, data = data, K = Epanechnikov)
+    pi_init <- gx_theta_init/sum(gx_theta_init)
+  }
+  
+  sigma_init <- rep(sd(data) / m, m)
+  
+  Hnow <- list(
+    pi = pi_init,
+    theta = theta_init,
+    sigma = sigma_init,
+    hdis = 1e5
+  )
+  
+  #Hbest <- update_Hpara(data, m, Hnow)
+  
+  for (iter in 1:maxiter) {
+    #print(paste0("Iteration: ", iter))
+    #print("Parameters:")
+    #print(Hnow)
+    
+    Hbest = update_Hpara(data, m, Hnow)
+    if (abs(Hbest$hdis - Hnow$hdis) <= tol) {
+      break
+    }
+    Hnow = Hbest
+  }
+  
+  Hnow$theta <- Hnow$theta
+  
+  Hnow$sigma <- Hnow$sigma
+  
+  return(Hnow)
+}
+
+# For fix m, find the optimal Hillinger distance and corresponding parameters
+Hmix_fix_gx <- function(data,
+                        m,
+                        m_fix,
+                        Hpar_fix,
+                        tol = 1e-5,
+                        maxiter = 50) {
+  # Initialization
+  # Use the last parameter as initial parameters
+  if(m == m_fix){
+    theta_init <- Hpar_fix$theta
+    pi_init <- Hpar_fix$pi
+    sigma_init <- Hpar_fix$sigma
+  }else{
+    # No parameter given
+    dx <- 1/100
+    x <- seq(min(data)-0.5, max(data)+0.5, dx)
+    gx_init <- get_density_standard(x = x, data = data, K = Epanechnikov)
+    delta_neighbor <- 0.2
+    
+    local_maxima <- find_local_maxima_sorted(x, gx_init, delta_neighbor)
+    x_max <- local_maxima$x
+    gx_max <- local_maxima$y
+    
+    local_m <- length(x_max)
+    
+    if(m <= local_m){
+      theta_init <- x_max[1:m]
+      pi_init <- gx_max[1:m]/sum(gx_max[1:m])
+    }else{
+      theta_init <- c(x_max, quantile(data, (1:(m-local_m)) / (m - local_m + 1)))
+      gx_theta_init <- get_density_standard(x = theta_init, data = data, K = Epanechnikov)
+      pi_init <- gx_theta_init/sum(gx_theta_init)
+    }
+    sigma_init <- rep(sd(data) / m, m)
+  }
+  
+  Hnow <- list(
+    pi = pi_init,
+    theta = theta_init,
+    sigma = sigma_init,
+    hdis = 1e5
+  )
+  
+  #Hbest <- update_Hpara(data, m, Hnow)
+  
+  for (iter in 1:maxiter) {
+    #print(paste0("Iteration: ", iter))
+    #print("Parameters:")
+    #print(Hnow)
+    
+    Hbest = update_Hpara_fix_gx(
+      data = data,
+      m = m,
+      Hpar = Hnow,
+      m_fix = m_fix,
+      Hpar_fix = Hpar_fix
+    )
+    if (abs(Hbest$hdis - Hnow$hdis) <= tol) {
+      break
+    }
+    Hnow = Hbest
+  }
+  
+  Hnow$theta <- Hnow$theta
+  
+  Hnow$sigma <- Hnow$sigma
+  
+  return(Hnow)
+}
+
+# Get the density function gx(x) given the normal parameters Hpar
+get_mix_normal_density <- function(x, m, Hpar){
+  if (length(x) > 1) {
+    gx <-
+      rowSums(sapply(1:m, function(s) {
+        Hpar$pi[s] * dnorm(x, Hpar$theta[s], Hpar$sigma[s])
+      }))
+  } else{
+    gx <-
+      sum(sapply(1:m, function(s) {
+        Hpar$pi[s] * dnorm(x, Hpar$theta[s], Hpar$sigma[s])
+      }))
+  }
+  return(gx)
+}
+
+# Get the Hellinger distance between two densities f and g, given precision
+get_H_diff <- function(f, g, dx){
+  return(sum(((sqrt(f) - sqrt(g))^2)*dx))
+}
+
+########## get_MHD #####
+# Get the Minimum Hellinger Distance clustering given data
+# inputs:
+# data: n by 1 vector, the input mixed data
+# maxm: max number of clusters 
+# 
+# outputs:
+# curHm: list, with columns:
+#     m, number of clusters
+#     Hpar: list, with columns:
+#       pi, weights
+#       theta, parameters(mean)
+#       sigma, parameters(variance) of the normal density
+get_MHD <- function(data, maxm = 20){
+  
+  n <- length(data)
+  alpha_nm <- 3/n
+  
+  xmin <- min(data) - 0.5
+  xmax <- max(data) + 0.5
+  dx <- 1/100
+  x <- seq(xmin + (dx / 2), xmax, dx)
+  
+  
+  cur_Hm <- Hmix(data, 1)
+  cur_Hm$m <- 1
+  
+
+  for(m in 1:maxm){
+    #print(m)
+    
+    # The nonparametric density \hat{g}_{n,m+1}, which is 
+    # also \tilde{g}_{n,m}
+    g_tilde_nm <-
+      get_density(
+        x,
+        data = data,
+        m = m,
+        Hpar = cur_Hm,
+        K = Epanechnikov
+      )
+    
+    # Fix \tilde{g}_{n,m}, get the parameters for g_tilde_m
+    Hm_hat_m0 <- Hmix_fix_gx(data = data, 
+                             m = m, 
+                             m_fix = m, 
+                             Hpar_fix = cur_Hm)
+    
+    #print(paste0("Best Parameters for ", m, ' clusters.'))
+    #print(Hm_hat_m0)
+    
+    # Fix \tilde{g}_{n,m}, get the parameters for g_hat_{m+1}
+    Hm_hat_m1 <- Hmix_fix_gx(data = data, 
+                             m = m + 1, 
+                             m_fix = m, 
+                             Hpar_fix = cur_Hm)
+    
+    #print(paste0("Best Parameters for ", m + 1, ' clusters.'))
+    #print(Hm_hat_m1)
+    
+    # g_tilde_m is the parametric density with m clusters
+    g_tilde_m <-
+      get_mix_normal_density(x = x, m = m, Hpar = Hm_hat_m0)
+    
+    # g_hat_m1 is the parametric density with m clusters
+    g_hat_m1 <-
+      get_mix_normal_density(x = x, m = m + 1, Hpar = Hm_hat_m1)
+    
+    # Plot the density
+    if (FALSE) {
+      
+      plot(x, g_tilde_nm, type = 'l', lwd = 2)
+      lines(x,
+            g_tilde_m,
+            lty = 1,
+            col = 2,
+            lwd = 2)
+      lines(x,
+            g_hat_m1,
+            lty = 1,
+            col = 3,
+            lwd = 2)
+      
+      legend(
+        "topright",
+        legend = c("g_tilde_nm: Nonparam", "g_tilde_m: M mix", "g_hat_m1: M+1 mix"),
+        # Text labels
+        col = c(1, 2, 3),
+        # Colors of the lines
+        lty = c(1, 1, 1),
+        # Line types
+        lwd = c(2, 2, 2),
+        # Line widths
+        cex = 0.8
+      )
+    }
+    
+    
+    H_diff_sq_m0 <- get_H_diff(g_tilde_nm, g_tilde_m, dx)
+    H_diff_sq_m1 <- get_H_diff(g_tilde_nm, g_hat_m1, dx)
+    
+    #print('Diff M:')
+    #print(H_diff_sq_m0)
+    #print('Diff M+1:')
+    #print(H_diff_sq_m1)
+    
+    if(H_diff_sq_m0 <= H_diff_sq_m1 + alpha_nm){
+      break
+    }else{
+      cur_Hm <- Hm_hat_m1
+      cur_Hm$m <- m+1
+      if(H_diff_sq_m1 <= alpha_nm){
+        # for the next iteration we must have 
+        # H_diff_sq_m0 <= H_diff_sq_m1 + alpha_nm
+        # so stop early
+        break
+      }
+    }
+  }
+  
+  return(cur_Hm)
+}
+
+
+########## mm_frechet_gen ##########
+# Function to generate moving-max Frechet distribution
+# of sample size n with order ord and shape parameter nu
+# inputs:
+#   n: number of observations
+#   ord: order of linear process
+#   nu: shape of the Frechet distribution
+#   a_list: the coefficients for the lag orders,
+#     a_list = (a_{k-ord}, a_{k-ord+1}, ..., a_{k}) such that 
+#     X_k = sum a_{k-ord}*eps_{k-ord} + a_{k-ord+1}*eps_{k-ord+1} + ... + a_{k}*eps_{k}
+#     by default, a_list = 1
+#
+# outputs:
+# X_mm_frechet: the generated moving-max Frechet process
+mm_frechet_gen <- function(n, ord, nu, a_list = 1) {
+  eps = rfrechet(n + ord,
+                 loc = 0,
+                 scale = 1,
+                 shape = nu)
+  X_mm_frechet = sapply((1 + ord):(n + ord), function (k){max(eps[(k-ord):k]*a_list)})
+  return(X_mm_frechet)
+}
+
+########## getHnhat ##########
+# get the Hill's estimator for given data X
+# inputs:
+#   X: observations
+#   alphan: tail level for the Hill's estimator
+#   nu: shape of the Frechet distribution
+#
+# outputs:
+# H_hat: the Hill's estimator
+getHnhat <- function(X, alphan = 0.05) {
+  n <- length(X)
+  
+  kn <- floor(n * alphan)
+  
+  X_sorted <- sort(X, decreasing = TRUE)
+  
+  H_hat <- sum(log(X_sorted[1:kn]) - log(X_sorted[kn + 1])) / kn
+  
+  return(H_hat)
+}
+
+##### get_simulaiton #####
+# get the time series tail index clustering simulations
+# inputs:
+#   parameters: list, given normal parameters of the clusters 
+#   p: number of time series
+#   n: number of observations for each time series
+#   alphan: tail level for the Hill's estimator
+#   seed: random seed 
+#
+# outputs:
+#   cluster_num: true cluster num
+#   cluster_hat: estimated cluster parameters
+#   m_hat: estimated cluster number Hm$m,
+#   ARI: Adjusted Rand Index metrics$ARI,
+#   loss: clustering loss 
+get_simulation <-
+  function(parameters,
+           p = 500,
+           n = 5000,
+           alphan = 0.05,
+           seed = 1) {
+    
+    categories <- 1:parameters$num_category
+    
+    cluster_num <-
+      sample(
+        categories,
+        size = p,
+        replace = TRUE,
+        prob = parameters$probabilities
+      )
+    
+    
+    Xs <-
+      sapply(1:p, function(i) {
+        mm_frechet_gen(n,
+                       parameters$ord_list[cluster_num[i]],
+                       parameters$nv_list[cluster_num[i]],
+                       parameters$a_lists[[cluster_num[i]]])
+      })
+    
+    
+    H_hats <- apply(Xs,
+                    MARGIN = 2,
+                    FUN = getHnhat,
+                    alphan = alphan)
+    print("Hill's Estimator:")
+    print(H_hats)
+    Hm <- get_MHD(H_hats)
+	  print(Hm)
+    
+    H_density <- sapply(1:Hm$m, function(i) {
+      Hm$pi[i] * dnorm(H_hats, Hm$theta[i], Hm$sigma[i])
+    })
+    
+    cluster_hat <- apply(H_density, 1, which.max)
+    
+    metrics  <- cluster_metric(cluster_num, cluster_hat)
+    
+    return(list(
+      cluster_num = cluster_num,
+      cluster_hat = cluster_hat,
+      m_hat = Hm$m,
+      ARI = metrics$ARI,
+      loss = metrics$loss
+    ))
+  }
+
+
+```
+
+# TIEC Implementation
+
+We shall here conduct a Monte Carlo simulation study to examine the finite-sample performance of the RMTC algorithm for clustering high-dimensional tail dependent time series based on their tail index estimates. For this, we consider the moving-maximum process, which has been popular in modeling tail dependent time series and was shown to be dense in the class of stationary processes whose finite-dimensional distributions are extreme-value distributions of a given type. In particular, let $(\nu_1,\nu_2,\nu_3) = (2,1,0.5)$, and we generate moving-maximum processes with three different tail index clusters as $$
+X_{i,j} = \left\{\begin{array}{l}
+\max(\epsilon_{i,j},0.5 \epsilon_{i-1,j}),\ \mathrm{if}\ j \in \mathcal G_1; \\
+\max(\epsilon_{i,j},\epsilon_{i-1,j}),\ \mathrm{if}\ j \in \mathcal G_2; \\
+\max(\epsilon_{i,j},\epsilon_{i-1,j}, \epsilon_{i-2,j}),\ \mathrm{if}\ j \in \mathcal G_3,
+\end{array}\right.
+$$ where $\epsilon_{i,j}$, $i \in \mathbb Z$, $1 \leq j \leq p$, are independent Frechet random variables with the cumulative distribution function
+
+$$ 
+F_j(x) = \exp(-x^{-\nu_k}),\quad j \in \mathcal G_k.
+$$ In this case, it can shown by elementary calculation that the distribution of $X_{i,j}$ is regularly varying with index $\nu_k$ if $j \in \mathcal G_k$, $k = 1,2,3$. Therefore, the underlying tail index $H_j = 0.5,1,2$ if $j \in \mathcal G_k$ for $k = 1,2,3$, respectively. We consider the following two scenarios.
+
+-   (M1) There are 30% time series from $\mathcal G_1$, 30% from $\mathcal G_2$, and 40% from $\mathcal G_3$.
+-   (M2) There are 10% time series from $\mathcal G_1$, 30% from $\mathcal G_2$, and 60% from $\mathcal G_3$.
+
+Therefore, scenario (M1) represents the case with relatively balanced sizes of homogeneous subgroups while scenario (M2) represents the case with relatively imbalanced subgroup sizes. Let $n \in \{5000, 10000\}$, $p \in \{500, 1000, 2000\}$ and $\alpha_n \in \{0.01, 0.05\}$.
+
+Example of implementing the simulation for Model 1 and write the outputs into a csv file.
+
+```{r}
+# parameterk = (1, 2) 
+parameterk <- 1
+
+
+parameters <- list(
+  list(
+    num_category = 3,
+    ord_list = c(1, 1, 2),
+    nv_list = c(2, 1, 0.5),
+    a_lists = list(c(0.5, 1), c(1, 1), c(1, 1, 1)),
+    probabilities = c(0.3, 0.3, 0.4)
+  ),
+  list(
+    num_category = 3,
+    ord_list = c(1, 1, 2),
+    nv_list = c(2, 1, 0.5),
+    a_lists = list(c(0.5, 1), c(1, 1), c(1, 1, 1)),
+    probabilities = c(0.1, 0.3, 0.6)
+  )
+)
+
+p = 500
+n = 5000
+alphan = 0.05
+parameter = parameters[[parameterk]]
+seedi = 1
+
+print(paste('p =', p, 'n = ', n, 'alphan = ', alphan))
+print(parameter)
+
+res <-
+  get_simulation(
+    parameters = parameter,
+    p = p,
+    n = n,
+    alphan = alphan,
+    seed = seedi
+  )
+
+print(res)
+
+write.csv(
+  file = paste(
+    'Model',
+    parameterk,
+    'p',
+    p,
+    'n',
+    n,
+    'alphan',
+    alphan * 100,
+    'No',
+    seedi,
+    '.csv',
+    sep = '_'
+  ),
+  data.frame(
+    No = seedi,
+    model = parameterk,
+    p = p,
+    n = n,
+    alphan = alphan,
+    m_hat = res$m_hat,
+    ARI = res$ARI,
+    loss = res$loss
+  )
+)
+```
+
+# Real Data Application
+
+Given the wide variety of firms and sectors, the Hill's estimate provides a tool for estimating the tail risk, reflecting extreme price movements in stock prices. In this section, we apply the RMTC algorithm to a financial data that consists of the daily adjusted closing prices of 1273 stocks in the Russell 3000 Index during the period from 01/01/2004 to 12/31/2023.
+
+The 1273 stocks considered represent all the stocks in the Russell 3000 index with complete historical data available from Yahoo! Finance (www.finance.yahoo.com) within the aforementioned time frame. We focus on the daily log returns, for which $n = 5033$ and $p = 1273$.
+
+The results are written in the csv and a histogram of clusters are provided in this cell.
+
+```{r}
+options(dplyr.verbose = FALSE)
+
+# Read the log adjusted return of Russell 3000 from 2004 to 2023
+
+df <- read.csv('Russell_3000_log_adj_return_040101_231231.csv')
+
+n = nrow(df)
+p = ncol(df)
+alphan = 0.05
+
+H_hats <- apply(df,
+                MARGIN = 2,
+                FUN = getHnhat,
+                alphan = alphan)
+
+hist(H_hats, breaks = 100)
+
+Hm <- get_MHD(H_hats)
+
+H_density <- sapply(1:length(Hm$pi), function(i) {
+  Hm$pi[i] * dnorm(H_hats, Hm$theta[i], Hm$sigma[i])
+})
+
+cluster_hat <- apply(H_density, 1, which.max)
+
+```
+
+```{r}
+data.frame(Hm) %>% print()
+
+cluster_hat %>% write.csv('Clusters for Russell3000.csv')
+data.frame(Hm) %>% write.csv('Clusters Summaries for Russell3000.csv')
+```
+
+```{r}
+Russells3000holdings_info <- read.csv('Russell3000_holdings.csv',
+                                            skip = 9,
+                                            header = TRUE)
+
+df1 <- data.frame(cluster_hat) %>% tibble::rownames_to_column(var = "Ticker")
+df2 <- data.frame(H_hats) %>% tibble::rownames_to_column(var = "Ticker")
+  
+Clusters_info <- df1 %>% left_join(df2, by = 'Ticker') %>% left_join(Russells3000holdings_info, by = "Ticker")
+write_csv(Clusters_info, file = "Russell3000_Clusters_Results_info.csv")
+
+
+
+
+
+
+# Create a histogram with different colors based on cluster_hat
+# Create a histogram with stacked bars based on cluster_hat
+# Check available font families on Windows
+# Extract the font family used for the axis labels
+# Create a dummy plot to extract the font family used for the axis labels
+dummy_plot <- ggplot() +
+  theme(axis.text.x = element_text(size = 12),  # Adjust the size as needed
+        axis.text.y = element_text(size = 12))  # Adjust the size as needed
+
+# Extract the font family used for the axis labels
+axis_font_family <- dummy_plot$theme$axis.text.x$family
+
+# Create the plot
+ggplot(Clusters_info, aes(x = H_hats, fill = factor(cluster_hat))) +
+  geom_histogram(binwidth = 0.005, position = "stack") +
+  scale_fill_manual(values = c("blue", "red", "gray")) +  # Change colors as needed
+  labs(x = expression(hat(H)), y = "Frequency", title = expression(paste("Histogram of ", hat(H), " by Clusters")), fill = "Cluster") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(family = axis_font_family, hjust = 0.5)  # Set title font family same as axis labels
+  )
+
+
+
+
+```
